@@ -1,0 +1,1627 @@
+# AI Insights Vista — Full Dashboard
+# Project: From AI News to Intelligent Insights and Social Media Poster
+# Install required packages before running:
+# pip install gradio feedparser pillow matplotlib wordcloud
+
+import gradio as gr
+import feedparser
+import hashlib
+import re
+import textwrap
+import urllib.request
+import urllib.parse
+import json
+import smtplib
+import ssl
+import threading
+from datetime import datetime
+from collections import Counter
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+
+# ---------------------------------------------------------------------------
+# Topic configuration
+# Each topic maps to a Google News RSS query focused on AI.
+# The labels are what appear on the poster cards.
+# ---------------------------------------------------------------------------
+
+TOPIC_SOURCES = {
+    "Technology": "artificial+intelligence+technology+AI+LLM",
+    "Business":   "AI+business+artificial+intelligence+economy",
+    "Health":     "AI+health+artificial+intelligence+medicine",
+    "Politics":   "AI+policy+artificial+intelligence+regulation+government",
+    "General":    "artificial+intelligence+AI+latest+news",
+}
+
+TOPIC_LABELS = {
+    "Technology": "Future Technology",
+    "Business":   "AI in Business",
+    "Health":     "AI and Health",
+    "Politics":   "AI Policy",
+    "General":    "AI Innovation",
+}
+
+# Words that lean positive — used by the lightweight sentiment classifier
+POSITIVE_WORDS = {
+    "breakthrough", "growth", "success", "innovation", "win", "gain",
+    "improve", "advance", "benefit", "launch", "rise", "achieve",
+    "record", "positive", "boost", "progress", "expand", "surge",
+    "profit", "lead", "award", "support", "develop", "partner",
+}
+
+# Words that lean negative — used by the lightweight sentiment classifier
+NEGATIVE_WORDS = {
+    "crisis", "crash", "fail", "drop", "risk", "warn", "attack",
+    "concern", "decline", "loss", "cut", "threat", "problem", "danger",
+    "ban", "dispute", "conflict", "recession", "fraud", "breach",
+    "shutdown", "protest", "debt", "hack", "fire", "collapse",
+}
+
+# Common filler words stripped out before keyword extraction
+STOP_WORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to",
+    "for", "of", "with", "by", "from", "is", "are", "was", "were",
+    "be", "been", "has", "have", "had", "do", "does", "did", "will",
+    "would", "could", "should", "may", "might", "its", "it", "as",
+    "this", "that", "these", "those", "how", "why", "what", "when",
+    "who", "new", "says", "over", "after", "into", "up",
+}
+
+# Short text labels used in the insight summary
+SENTIMENT_ICON = {"Positive": "[+]", "Neutral": "[~]", "Negative": "[-]"}
+
+# Pastel colour palette used on the news cards, one per topic
+TOPIC_PASTEL = {
+    "Technology": ("#dbeafe", "#3b82f6", "#1e3a5f", "#3b82f6", "#1d4ed8", "#bfdbfe", "#1d4ed8"),
+    "Business":   ("#dcfce7", "#16a34a", "#14532d", "#16a34a", "#15803d", "#bbf7d0", "#14532d"),
+    "Health":     ("#fce7f3", "#db2777", "#831843", "#db2777", "#be185d", "#fbcfe8", "#831843"),
+    "Politics":   ("#fef3c7", "#d97706", "#78350f", "#d97706", "#b45309", "#fde68a", "#78350f"),
+    "General":    ("#ede9fe", "#7c3aed", "#3b0764", "#7c3aed", "#6d28d9", "#ddd6fe", "#3b0764"),
+}
+
+
+# ---------------------------------------------------------------------------
+# News fetching
+# Pulls articles from Google News RSS and removes near-duplicates using a
+# SHA-256 hash of the title plus source name.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# UPDATED News fetching (STRICT: last 24 hours + latest first)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta
+
+def is_today(published):
+    """Check if article is within last 24 hours"""
+    if not published:
+        return False
+    try:
+        published_dt = datetime(*published[:6])
+        return published_dt >= (datetime.now() - timedelta(days=1))
+    except:
+        return False
+
+
+def fetch_news_by_topic(topic_key: str, max_articles: int = 10) -> list:
+    query = TOPIC_SOURCES.get(topic_key, "artificial+intelligence")
+
+    # ✅ LAST 24 HOURS + LATEST FIRST
+    url = (
+        f"https://news.google.com/rss/search?"
+        f"q={query}+when:1d"
+        f"&hl=en-IN&gl=IN&ceid=IN:en"
+        f"&scoring=n"
+    )
+
+    feed = feedparser.parse(url)
+
+    seen   = set()
+    result = []
+
+    for entry in feed.entries:
+        title      = entry.get("title", "").strip()
+        source     = entry.get("source", {}).get("title", "Unknown")
+        link       = entry.get("link", "#")
+        published  = entry.get("published_parsed")
+
+        # ✅ STRICT FILTER: only today's news
+        if not is_today(published):
+            continue
+
+        # Remove duplicates
+        fingerprint = hashlib.sha256(
+            (title.lower() + source.lower()).encode()
+        ).hexdigest()
+
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+
+        result.append({
+            "title":  title,
+            "link":   link,
+            "source": source,
+            "topic":  topic_key,
+        })
+
+        # Limit to top N
+        if len(result) >= max_articles:
+            break
+
+    return result
+# ---------------------------------------------------------------------------
+# Sentiment classification
+# This is a simple lexicon-based approach. It counts how many positive and
+# negative words appear in the headline and decides the sentiment from that.
+# For production, replace this with a fine-tuned RoBERTa model.
+# ---------------------------------------------------------------------------
+
+def classify_sentiment(text: str):
+    words    = set(re.findall(r"\b\w+\b", text.lower()))
+    pos_hits = len(words & POSITIVE_WORDS)
+    neg_hits = len(words & NEGATIVE_WORDS)
+    total    = pos_hits + neg_hits or 1
+
+    if pos_hits > neg_hits:
+        return "Positive", round(0.65 + 0.3 * (pos_hits / total), 2)
+    elif neg_hits > pos_hits:
+        return "Negative", round(0.65 + 0.3 * (neg_hits / total), 2)
+    return "Neutral", 0.72
+
+
+def summarize_article(title: str) -> str:
+    # Trim very long headlines to 90 characters for display
+    # In production, replace this with BART abstractive summarization
+    title = title.strip().rstrip(".")
+    if len(title) > 90:
+        title = title[:87] + "..."
+    return title
+
+
+def aggregate_insights(articles: list) -> list:
+    # Attach sentiment and summary to each article so the rest of the code
+    # only needs to look at one enriched list
+    enriched = []
+    for art in articles:
+        sentiment, confidence = classify_sentiment(art["title"])
+        enriched.append({
+            **art,
+            "sentiment":  sentiment,
+            "confidence": confidence,
+            "summary":    summarize_article(art["title"]),
+        })
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# Keyword extraction
+# Tokenises all article titles, removes stop words, and counts word frequency.
+# This gives us a simple but effective view of what is trending right now.
+# ---------------------------------------------------------------------------
+
+def extract_keywords(articles: list, top_n: int = 10) -> list:
+    words = []
+    for art in articles:
+        tokens = re.findall(r"\b[A-Za-z]{4,}\b", art["title"])
+        words.extend(w.lower() for w in tokens if w.lower() not in STOP_WORDS)
+    return Counter(words).most_common(top_n)
+
+
+def generate_insight_summary(articles: list) -> str:
+    if not articles:
+        return "No articles fetched yet. Select topics and click Fetch."
+
+    sentiment_counts = Counter(a["sentiment"] for a in articles)
+    topic_counts     = Counter(a["topic"] for a in articles)
+    top_topic        = topic_counts.most_common(1)[0][0]
+    total            = len(articles)
+
+    lines = [
+        f"Analysed {total} articles across {len(topic_counts)} topic(s).",
+        "",
+        f"  Positive : {sentiment_counts.get('Positive', 0)} articles",
+        f"  Neutral  : {sentiment_counts.get('Neutral',  0)} articles",
+        f"  Negative : {sentiment_counts.get('Negative', 0)} articles",
+        "",
+        f"Most active topic: {top_topic}",
+        "",
+        "Top headlines",
+        "-" * 50,
+    ]
+    for art in articles[:6]:
+        label = SENTIMENT_ICON.get(art["sentiment"], " ")
+        lines.append(f"  {label} [{art['topic']}] {art['summary'][:70]}...")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# News card HTML
+# Renders the fetched articles as a responsive pastel card grid.
+# Each card is coloured by its topic category.
+# ---------------------------------------------------------------------------
+
+def generate_news_html(articles: list) -> str:
+    SENT_BADGE = {
+        "Positive": ("Positive", "#166534", "#dcfce7"),
+        "Neutral":  ("Neutral",  "#1e3a5f", "#dbeafe"),
+        "Negative": ("Negative", "#7f1d1d", "#fee2e2"),
+    }
+
+    html = '<div class="grid-container">'
+
+    for art in articles:
+        topic      = art.get("topic", "General")
+        sentiment  = art.get("sentiment", "Neutral")
+        confidence = art.get("confidence", 0.70)
+
+        card_bg, border, title_col, src_col, link_col, bdg_bg, bdg_fg = \
+            TOPIC_PASTEL.get(topic, TOPIC_PASTEL["General"])
+
+        badge_text, b_fg, b_bg = SENT_BADGE.get(sentiment, SENT_BADGE["Neutral"])
+
+        html += f"""
+        <div style="
+            background:{card_bg}; border:2px solid {border};
+            border-radius:16px; padding:18px;
+            display:flex; flex-direction:column; gap:10px;
+            box-shadow:0 4px 14px rgba(0,0,0,0.08);
+        ">
+            <div style="display:flex; justify-content:space-between;
+                        align-items:center; flex-wrap:wrap; gap:6px;">
+                <span style="background:{bdg_bg}; color:{bdg_fg}; font-size:0.72em;
+                             font-weight:700; padding:3px 10px; border-radius:99px;">
+                    {topic}
+                </span>
+                <span style="background:{b_bg}; color:{b_fg}; font-size:0.70em;
+                             font-weight:700; padding:3px 10px; border-radius:99px;">
+                    {badge_text} {int(confidence * 100)}%
+                </span>
+            </div>
+            <div style="color:{title_col}; font-size:0.95em;
+                        font-weight:700; line-height:1.5;">
+                {art['summary']}
+            </div>
+            <div style="color:{src_col}; font-size:0.78em; font-weight:500;">
+                {art['source']}
+            </div>
+            <a href="{art['link']}" target="_blank"
+               style="color:{link_col}; font-size:0.82em;
+                      font-weight:600; text-decoration:underline;">
+                Read full article
+            </a>
+        </div>"""
+
+    html += "</div>"
+    return html
+
+
+# ---------------------------------------------------------------------------
+# Poster generation
+# Creates a light-themed social media poster styled like the "AI Technology
+# Trends" template. Cards alternate left and right down the canvas.
+# ---------------------------------------------------------------------------
+
+# Poster colour constants
+P_BG         = (232, 244, 248)
+P_HEADER_BG  = (0, 150, 150)
+P_CARD_BG    = (255, 255, 255)
+P_CARD_BORD  = (0, 150, 150)
+P_HEADER_TXT = (255, 255, 255)
+P_LABEL_TXT  = (20, 20, 20)
+P_BODY_TXT   = (80, 80, 80)
+P_SHADOW     = (185, 215, 225)
+P_FOOTER_TXT = (0, 150, 150)
+
+
+def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    # Try common system fonts in order. Fall back to the PIL default if none found.
+    candidates = (
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+        if bold else
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]
+    )
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except (IOError, OSError):
+            continue
+    return ImageFont.load_default()
+
+
+def generate_poster(articles: list) -> Image.Image:
+    canvas_w, canvas_h = 900, 1200
+    img  = Image.new("RGB", (canvas_w, canvas_h), P_BG)
+    draw = ImageDraw.Draw(img)
+
+    font_header = load_font(52, bold=True)
+    font_label  = load_font(26, bold=True)
+    font_body   = load_font(20, bold=False)
+    font_footer = load_font(24, bold=True)
+
+    # Draw the teal header bar
+    draw.rectangle([0, 0, canvas_w, 115], fill=P_HEADER_BG)
+    draw.text((35, 28), "AI TECHNOLOGY TRENDS", font=font_header, fill=P_HEADER_TXT)
+
+    card_w   = 600
+    card_h   = 150
+    gap      = 28
+    left_x   = 30
+    right_x  = canvas_w - card_w - 30
+    start_y  = 145
+
+    for index, art in enumerate(articles[:5]):
+        # Alternate cards between left and right sides
+        card_x = left_x if index % 2 == 0 else right_x
+        card_y = start_y + index * (card_h + gap)
+
+        # Soft shadow behind the card
+        draw.rounded_rectangle(
+            [card_x + 7, card_y + 7, card_x + card_w + 7, card_y + card_h + 7],
+            radius=10, fill=P_SHADOW,
+        )
+
+        # White card background
+        draw.rounded_rectangle(
+            [card_x, card_y, card_x + card_w, card_y + card_h],
+            radius=10, fill=P_CARD_BG, outline=P_CARD_BORD, width=1,
+        )
+
+        # Teal left accent stripe
+        draw.rounded_rectangle(
+            [card_x, card_y, card_x + 9, card_y + card_h],
+            radius=6, fill=P_CARD_BORD,
+        )
+
+        # Topic label in bold dark text
+        label = TOPIC_LABELS.get(art["topic"], art["topic"])
+        draw.text((card_x + 22, card_y + 14), label, font=font_label, fill=P_LABEL_TXT)
+
+        # Headline body text — strip trailing source attribution if present
+        body  = re.sub(r"\s*-\s*[^-]{3,45}$", "", art["summary"]).strip()
+        lines = textwrap.wrap(body, width=52)[:2]
+        for line_index, line in enumerate(lines):
+            draw.text(
+                (card_x + 22, card_y + 52 + line_index * 30),
+                line, font=font_body, fill=P_BODY_TXT,
+            )
+
+    # Footer text
+    footer_y = start_y + 5 * (card_h + gap) + 18
+    footer_y = max(footer_y, canvas_h - 75)
+    draw.text(
+        (canvas_w // 2 - 225, footer_y),
+        "Follow for Daily AI Insights",
+        font=font_footer, fill=P_FOOTER_TXT,
+    )
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Sentiment and keyword charts
+# Two-panel matplotlib figure shown in the Sentiment Chart tab.
+# Left panel shows how many articles are positive, neutral, and negative.
+# Right panel shows the most frequently mentioned words across all headlines.
+# ---------------------------------------------------------------------------
+
+def generate_charts(articles: list):
+    sentiment_counts = Counter(a["sentiment"] for a in articles)
+    keywords         = extract_keywords(articles, top_n=5)
+
+    fig, (ax_sent, ax_kw) = plt.subplots(1, 2, figsize=(12, 5), facecolor="#e8f4fc")
+
+    # Sentiment bar chart
+    labels = ["Positive", "Neutral", "Negative"]
+    values = [sentiment_counts.get(label, 0) for label in labels]
+    colors = ["#22c55e", "#60a5fa", "#f87171"]
+    bars   = ax_sent.bar(labels, values, color=colors, edgecolor="#cbd5e1",
+                         linewidth=0.8, width=0.5)
+    ax_sent.set_facecolor("#f0f9ff")
+    ax_sent.set_title("Sentiment Distribution", color="#1e3a5f", pad=12)
+    ax_sent.set_ylabel("Article Count", color="#475569")
+    ax_sent.tick_params(colors="#475569")
+    for spine in ax_sent.spines.values():
+        spine.set_edgecolor("#cbd5e1")
+    for bar, val in zip(bars, values):
+        ax_sent.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.1,
+            str(val), ha="center", color="#1e3a5f", fontsize=11,
+        )
+
+    # Keyword frequency horizontal bar chart
+    if keywords:
+        kw_labels = [k.capitalize() for k, _ in keywords][::-1]
+        kw_values = [v for _, v in keywords][::-1]
+        ax_kw.barh(kw_labels, kw_values, color="#818cf8",
+                   edgecolor="#cbd5e1", linewidth=0.8)
+    ax_kw.set_facecolor("#f0f9ff")
+    ax_kw.set_title("Top Keywords", color="#1e3a5f", pad=12)
+    ax_kw.set_xlabel("Frequency", color="#475569")
+    ax_kw.tick_params(colors="#475569")
+    for spine in ax_kw.spines.values():
+        spine.set_edgecolor("#cbd5e1")
+
+    plt.tight_layout(pad=2.5)
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Trending keywords tab
+# Full-size horizontal bar chart of the top 15 keywords, colour-coded by
+# frequency tier, plus a styled HTML frequency table below it.
+# ---------------------------------------------------------------------------
+
+def generate_trending_chart(articles: list):
+    if not articles:
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#e8f4fc")
+        ax.set_facecolor("#f0f9ff")
+        ax.text(0.5, 0.5, "No articles fetched yet.",
+                ha="center", va="center", color="#475569",
+                fontsize=13, transform=ax.transAxes)
+        ax.axis("off")
+        return fig
+
+    keywords = extract_keywords(articles, top_n=15)
+
+    if not keywords:
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor="#e8f4fc")
+        ax.text(0.5, 0.5, "No keywords found.", ha="center", va="center",
+                color="#475569", fontsize=13, transform=ax.transAxes)
+        ax.axis("off")
+        return fig
+
+    labels  = [kw.capitalize() for kw, _ in keywords][::-1]
+    values  = [cnt for _, cnt in keywords][::-1]
+    max_val = max(values)
+
+    # Colour each bar by how frequent the word is relative to the top word
+    colors = []
+    for v in values:
+        ratio = v / max_val
+        if ratio >= 0.66:
+            colors.append("#2dd4bf")
+        elif ratio >= 0.33:
+            colors.append("#60a5fa")
+        else:
+            colors.append("#a78bfa")
+
+    fig, ax = plt.subplots(
+        figsize=(10, max(5, len(labels) * 0.45)), facecolor="#e8f4fc"
+    )
+    ax.set_facecolor("#f0f9ff")
+
+    bars = ax.barh(labels, values, color=colors,
+                   edgecolor="#cbd5e1", linewidth=0.6, height=0.65)
+
+    for bar, val in zip(bars, values):
+        ax.text(
+            bar.get_width() + 0.05,
+            bar.get_y() + bar.get_height() / 2,
+            str(val), va="center", color="#1e3a5f", fontsize=10,
+        )
+
+    ax.set_xlabel("Frequency", color="#475569", fontsize=11)
+    ax.set_title("Trending Keywords Across AI News",
+                 color="#1e3a5f", fontsize=13, pad=14, loc="left")
+    ax.tick_params(colors="#475569", labelsize=10)
+    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#cbd5e1")
+    ax.set_xlim(0, max_val * 1.18)
+
+    legend_items = [
+        mpatches.Patch(facecolor="#2dd4bf", label="High frequency"),
+        mpatches.Patch(facecolor="#60a5fa", label="Mid frequency"),
+        mpatches.Patch(facecolor="#a78bfa", label="Low frequency"),
+    ]
+    ax.legend(handles=legend_items, loc="lower right",
+              facecolor="#f0f9ff", edgecolor="#cbd5e1",
+              labelcolor="#1e3a5f", fontsize=9)
+
+    plt.tight_layout(pad=1.5)
+    return fig
+
+
+def generate_trending_html(articles: list) -> str:
+    if not articles:
+        return "<p style='color:#475569;padding:12px;'>Fetch news first.</p>"
+
+    keywords = extract_keywords(articles, top_n=15)
+    if not keywords:
+        return "<p style='color:#475569;padding:12px;'>No keywords found.</p>"
+
+    max_cnt = keywords[0][1]
+
+    # Find which topics each keyword appears in
+    topic_map: dict = {}
+    for art in articles:
+        tokens = set(re.findall(r"\b[A-Za-z]{4,}\b", art["title"].lower()))
+        for kw, _ in keywords:
+            if kw in tokens:
+                topic_map.setdefault(kw, set()).add(art["topic"])
+
+    TOPIC_COLORS = {
+        "Technology": ("#dbeafe", "#1d4ed8"),
+        "Business":   ("#dcfce7", "#15803d"),
+        "Health":     ("#fce7f3", "#be185d"),
+        "Politics":   ("#fef3c7", "#b45309"),
+        "General":    ("#ede9fe", "#6d28d9"),
+    }
+
+    rows = ""
+    for rank, (kw, cnt) in enumerate(keywords, 1):
+        pct    = int(cnt / max_cnt * 100)
+        topics = topic_map.get(kw, set())
+
+        topic_badges = "".join(
+            f'<span style="background:{TOPIC_COLORS.get(t, ("#f1f5f9","#334155"))[0]};'
+            f'color:{TOPIC_COLORS.get(t, ("#f1f5f9","#334155"))[1]};font-size:10px;'
+            f'font-weight:600;padding:2px 7px;border-radius:99px;margin-right:4px;">'
+            f'{t}</span>'
+            for t in sorted(topics)
+        )
+
+        medal = (
+            "1st" if rank == 1 else
+            "2nd" if rank == 2 else
+            "3rd" if rank == 3 else
+            f"#{rank}"
+        )
+
+        rows += f"""
+        <tr style="border-bottom:1px solid #e2e8f0;">
+            <td style="padding:10px 12px;text-align:center;color:#475569;
+                       font-size:12px;">{medal}</td>
+            <td style="padding:10px 12px;color:#1e3a5f;font-weight:600;
+                       font-size:14px;">{kw.capitalize()}</td>
+            <td style="padding:10px 12px;">
+                <div style="background:#e2e8f0;border-radius:99px;
+                            height:8px;width:120px;overflow:hidden;">
+                    <div style="background:linear-gradient(90deg,#2dd4bf,#60a5fa);
+                                height:100%;width:{pct}%;border-radius:99px;"></div>
+                </div>
+            </td>
+            <td style="padding:10px 12px;color:#2563eb;font-weight:700;
+                       font-size:14px;text-align:center;">{cnt}</td>
+            <td style="padding:10px 12px;">{topic_badges}</td>
+        </tr>"""
+
+    return f"""
+    <div style="overflow-x:auto;">
+    <table style="width:100%;border-collapse:collapse;
+                  font-family:'Segoe UI',sans-serif;
+                  background:#ffffff;border-radius:12px;overflow:hidden;">
+        <thead>
+            <tr style="background:#dbeafe;">
+                <th style="padding:12px;color:#1e3a5f;font-size:11px;
+                           font-weight:600;text-align:center;">RANK</th>
+                <th style="padding:12px;color:#1e3a5f;font-size:11px;
+                           font-weight:600;text-align:left;">KEYWORD</th>
+                <th style="padding:12px;color:#1e3a5f;font-size:11px;
+                           font-weight:600;text-align:left;">FREQUENCY</th>
+                <th style="padding:12px;color:#1e3a5f;font-size:11px;
+                           font-weight:600;text-align:center;">COUNT</th>
+                <th style="padding:12px;color:#1e3a5f;font-size:11px;
+                           font-weight:600;text-align:left;">TOPICS</th>
+            </tr>
+        </thead>
+        <tbody>{rows}</tbody>
+    </table>
+    </div>"""
+
+
+# ---------------------------------------------------------------------------
+# Word cloud
+# Builds a word cloud from article titles. Words are coloured by the dominant
+# sentiment of the articles they appear in. Falls back to a bar chart if the
+# wordcloud library is not installed.
+# ---------------------------------------------------------------------------
+
+def generate_word_cloud(articles: list):
+    if not articles:
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#e8f4fc")
+        ax.set_facecolor("#f0f9ff")
+        ax.text(0.5, 0.5, "No articles fetched yet.",
+                ha="center", va="center", color="#475569",
+                fontsize=13, transform=ax.transAxes)
+        ax.axis("off")
+        return fig
+
+    word_freq: Counter = Counter()
+    word_sentiment: dict = {}
+
+    for art in articles:
+        tokens    = re.findall(r"\b[A-Za-z]{4,}\b", art["title"])
+        sentiment = art.get("sentiment", "Neutral")
+        for raw in tokens:
+            w = raw.lower()
+            if w in STOP_WORDS:
+                continue
+            word_freq[w] += 1
+            word_sentiment.setdefault(w, Counter())[sentiment] += 1
+
+    if not word_freq:
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#e8f4fc")
+        ax.text(0.5, 0.5, "No keywords found.", ha="center", va="center",
+                color="#475569", fontsize=13, transform=ax.transAxes)
+        ax.axis("off")
+        return fig
+
+    # Colour each word by its most common associated sentiment
+    SENT_PALETTES = {
+        "Positive": ["#2dd4bf", "#34d399", "#4ade80"],
+        "Negative": ["#f87171", "#fb923c", "#ef4444"],
+        "Neutral":  ["#60a5fa", "#818cf8", "#a78bfa"],
+    }
+
+    def color_func(word, font_size, position, orientation,
+                   random_state=None, **kwargs):
+        import random
+        dominant = (
+            word_sentiment.get(word, Counter()).most_common(1)[0][0]
+            if word in word_sentiment else "Neutral"
+        )
+        return random.choice(SENT_PALETTES.get(dominant, SENT_PALETTES["Neutral"]))
+
+    try:
+        from wordcloud import WordCloud
+
+        wc = WordCloud(
+            width=1200,
+            height=600,
+            background_color="#e8f4fc",
+            max_words=80,
+            prefer_horizontal=0.85,
+            collocations=False,
+            min_font_size=11,
+            max_font_size=90,
+            color_func=color_func,
+        ).generate_from_frequencies(dict(word_freq))
+
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#e8f4fc")
+        ax.imshow(wc, interpolation="bilinear")
+        ax.axis("off")
+        ax.set_title(
+            "Word Cloud  —  size = frequency   colour = sentiment"
+            "  (teal=positive   red=negative   blue=neutral)",
+            color="#475569", fontsize=10, pad=10, loc="center",
+        )
+        plt.tight_layout(pad=0.5)
+
+    except ImportError:
+        # wordcloud not installed — show bar chart as fallback
+        top    = word_freq.most_common(30)
+        labels = [w.capitalize() for w, _ in top]
+        sizes  = [c for _, c in top]
+        colors = []
+        for w, _ in top:
+            dominant = (
+                word_sentiment.get(w, Counter()).most_common(1)[0][0]
+                if w in word_sentiment else "Neutral"
+            )
+            colors.append(
+                "#2dd4bf" if dominant == "Positive"
+                else "#f87171" if dominant == "Negative"
+                else "#818cf8"
+            )
+
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor="#e8f4fc")
+        ax.set_facecolor("#f0f9ff")
+        bars = ax.barh(labels[::-1], sizes[::-1], color=colors[::-1],
+                       edgecolor="#cbd5e1", linewidth=0.5, height=0.7)
+        for bar, val in zip(bars, sizes[::-1]):
+            ax.text(bar.get_width() + 0.05, bar.get_y() + bar.get_height() / 2,
+                    str(val), va="center", color="#1e3a5f", fontsize=9)
+        ax.set_facecolor("#f0f9ff")
+        ax.set_title(
+            "Keyword Frequency  (install wordcloud library for the visual cloud)",
+            color="#475569", fontsize=11, pad=10,
+        )
+        ax.tick_params(colors="#475569", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#cbd5e1")
+        ax.set_xlim(0, max(sizes) * 1.15)
+        plt.tight_layout(pad=1.2)
+
+    return fig
+
+
+def generate_word_cloud_stats_html(articles: list) -> str:
+    # Summary stats shown below the word cloud
+    if not articles:
+        return ""
+
+    counts    = Counter(a.get("sentiment", "Neutral") for a in articles)
+    total     = len(articles)
+    word_freq = Counter(
+        w.lower()
+        for a in articles
+        for w in re.findall(r"\b[A-Za-z]{4,}\b", a["title"])
+        if w.lower() not in STOP_WORDS
+    )
+    unique_kw = len(word_freq)
+    top3      = ", ".join(w.capitalize() for w, _ in word_freq.most_common(3))
+
+    return f"""
+    <div style="display:flex;gap:12px;flex-wrap:wrap;padding:12px 4px;
+                font-family:'Segoe UI',sans-serif;">
+        <div style="background:#dcfce7;border:1px solid #16a34a;border-radius:10px;
+                    padding:10px 18px;text-align:center;">
+            <div style="font-size:11px;color:#15803d;font-weight:600;">POSITIVE</div>
+            <div style="font-size:22px;font-weight:700;color:#14532d;">
+                {counts.get('Positive', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">articles</div>
+        </div>
+        <div style="background:#dbeafe;border:1px solid #3b82f6;border-radius:10px;
+                    padding:10px 18px;text-align:center;">
+            <div style="font-size:11px;color:#1d4ed8;font-weight:600;">NEUTRAL</div>
+            <div style="font-size:22px;font-weight:700;color:#1e3a5f;">
+                {counts.get('Neutral', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">articles</div>
+        </div>
+        <div style="background:#fee2e2;border:1px solid #ef4444;border-radius:10px;
+                    padding:10px 18px;text-align:center;">
+            <div style="font-size:11px;color:#dc2626;font-weight:600;">NEGATIVE</div>
+            <div style="font-size:22px;font-weight:700;color:#7f1d1d;">
+                {counts.get('Negative', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">articles</div>
+        </div>
+        <div style="background:#f0f9ff;border:1px solid #93c5fd;border-radius:10px;
+                    padding:10px 18px;text-align:center;">
+            <div style="font-size:11px;color:#1d4ed8;font-weight:600;">UNIQUE KEYWORDS</div>
+            <div style="font-size:22px;font-weight:700;color:#1e3a5f;">{unique_kw}</div>
+            <div style="font-size:10px;color:#64748b;">across all articles</div>
+        </div>
+        <div style="background:#f0f9ff;border:1px solid #93c5fd;border-radius:10px;
+                    padding:10px 18px;flex:1;min-width:180px;">
+            <div style="font-size:11px;color:#1d4ed8;font-weight:600;margin-bottom:4px;">
+                TOP 3 KEYWORDS
+            </div>
+            <div style="font-size:14px;font-weight:600;color:#1e3a5f;">{top3}</div>
+            <div style="font-size:10px;color:#64748b;">most frequent terms</div>
+        </div>
+        <div style="background:#f0f9ff;border:1px solid #93c5fd;border-radius:10px;
+                    padding:10px 18px;text-align:center;">
+            <div style="font-size:11px;color:#1d4ed8;font-weight:600;">TOTAL ARTICLES</div>
+            <div style="font-size:22px;font-weight:700;color:#1e3a5f;">{total}</div>
+            <div style="font-size:10px;color:#64748b;">analysed</div>
+        </div>
+    </div>"""
+
+
+# ---------------------------------------------------------------------------
+# Wikipedia lookup
+# Fetches the summary for an AI topic from the Wikipedia REST API.
+# Tries "Artificial intelligence <topic>" first, then the raw term.
+# ---------------------------------------------------------------------------
+
+def fetch_wikipedia_summary(topic: str) -> str:
+    topic = topic.strip()
+    if not topic:
+        return "Please enter an AI topic to look up."
+
+    def query(term: str) -> str:
+        encoded = urllib.parse.quote(term.replace(" ", "_"))
+        url     = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}"
+        req     = urllib.request.Request(url, headers={"User-Agent": "AIInsightsVista/1.0"})
+        resp    = urllib.request.urlopen(req, timeout=8)
+        data    = json.loads(resp.read().decode())
+        title   = data.get("title", term)
+        extract = data.get("extract", "No summary found.")
+        page    = data.get("content_urls", {}).get("desktop", {}).get("page", "")
+        result  = f"{title}\n\n{extract}"
+        if page:
+            result += f"\n\nFull article: {page}"
+        return result
+
+    for attempt in [f"Artificial intelligence {topic}", topic]:
+        try:
+            return query(attempt)
+        except Exception:
+            continue
+
+    return (
+        f"Could not find a Wikipedia article for '{topic}'.\n"
+        "Try terms like 'Large Language Models', 'Generative AI', or 'Neural Networks'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn post generator
+# Formats the fetched headlines into a ready-to-publish LinkedIn post with
+# auto-generated hashtags from the top keywords.
+# ---------------------------------------------------------------------------
+
+def generate_linkedin_post(articles: list) -> str:
+    if not articles:
+        return "No articles loaded yet. Fetch news from the AI Insights tab first."
+
+    headlines = [f"- {a['summary']} ({a['source']})" for a in articles[:5]]
+    body      = "\n".join(headlines)
+
+    keywords = extract_keywords(articles, top_n=6)
+    skip     = {"artificial", "intelligence", "with", "that", "this", "from"}
+    tags     = " ".join(
+        f"#{kw.capitalize()}"
+        for kw, _ in keywords
+        if kw.lower() not in skip
+    )[:80]
+    if not tags:
+        tags = "#AI #Innovation #TechTrends"
+
+    return f"AI is transforming industries:\n\n{body}\n\n{tags}"
+
+
+# ---------------------------------------------------------------------------
+# Twitter thread generator
+# Breaks the news into a numbered thread where each tweet is under 280 chars.
+# Thread structure: hook tweet -> one article per tweet -> closing CTA tweet.
+# ---------------------------------------------------------------------------
+
+def generate_twitter_thread(articles: list) -> str:
+    if not articles:
+        return "No articles loaded yet. Fetch news from the AI Insights tab first."
+
+    subset = articles[:8]
+    total  = len(subset)
+
+    SENT_LABEL = {"Positive": "[+]", "Neutral": "[~]", "Negative": "[-]"}
+    tweets     = []
+
+    # Opening tweet — sets context for the thread
+    topics_list = list(dict.fromkeys(a["topic"] for a in subset))
+    topic_str   = " / ".join(topics_list[:3])
+    hook = (
+        f"AI News Thread — what is happening right now?\n\n"
+        f"Topics: {topic_str}\n"
+        f"({total} stories below)"
+    )
+    tweets.append(f"1/{total + 2}\n{hook}")
+
+    # One tweet per article
+    for i, art in enumerate(subset, 2):
+        label     = SENT_LABEL.get(art.get("sentiment", "Neutral"), "")
+        sentiment = art.get("sentiment", "Neutral")
+        source    = art.get("source", "")
+        title     = re.sub(r"\s*-\s*[^-]{3,40}$", "", art.get("summary", "")).strip()
+
+        prefix      = f"{i}/{total + 2}\n{label} [{sentiment}]\n"
+        suffix      = f"\n\n— {source}"
+        max_len     = 280 - len(prefix) - len(suffix) - 5
+        if len(title) > max_len:
+            title = title[:max_len - 1] + "..."
+
+        tweets.append(f"{prefix}{title}{suffix}")
+
+    # Closing tweet with hashtags
+    keywords = extract_keywords(articles, top_n=5)
+    skip     = {"artificial", "intelligence", "with", "that", "this", "from", "using"}
+    hashtags = " ".join(
+        f"#{kw.capitalize()}"
+        for kw, _ in keywords
+        if kw.lower() not in skip
+    )[:80]
+    if not hashtags:
+        hashtags = "#AI #TechNews #ArtificialIntelligence"
+
+    cta = f"{total + 2}/{total + 2}\nFollow for daily AI insights.\n\n{hashtags} #AINews"
+    tweets.append(cta)
+
+    divider = "\n" + "-" * 45 + "\n"
+    return divider.join(tweets)
+
+
+def generate_twitter_stats_html(articles: list) -> str:
+    if not articles:
+        return ""
+
+    subset       = articles[:8]
+    total_tweets = len(subset) + 2
+    sent_counts  = Counter(a.get("sentiment", "Neutral") for a in subset)
+
+    return f"""
+    <div style="display:flex;gap:10px;flex-wrap:wrap;padding:10px 4px;
+                font-family:'Segoe UI',sans-serif;margin-top:8px;">
+        <div style="background:#dbeafe;border:1px solid #3b82f6;
+                    border-radius:10px;padding:10px 16px;text-align:center;">
+            <div style="font-size:10px;color:#1d4ed8;font-weight:600;">TOTAL TWEETS</div>
+            <div style="font-size:22px;font-weight:700;color:#1e3a5f;">{total_tweets}</div>
+            <div style="font-size:10px;color:#64748b;">in thread</div>
+        </div>
+        <div style="background:#dcfce7;border:1px solid #16a34a;
+                    border-radius:10px;padding:10px 16px;text-align:center;">
+            <div style="font-size:10px;color:#15803d;font-weight:600;">POSITIVE</div>
+            <div style="font-size:22px;font-weight:700;color:#14532d;">
+                {sent_counts.get('Positive', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">stories</div>
+        </div>
+        <div style="background:#dbeafe;border:1px solid #3b82f6;
+                    border-radius:10px;padding:10px 16px;text-align:center;">
+            <div style="font-size:10px;color:#1d4ed8;font-weight:600;">NEUTRAL</div>
+            <div style="font-size:22px;font-weight:700;color:#1e3a5f;">
+                {sent_counts.get('Neutral', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">stories</div>
+        </div>
+        <div style="background:#fee2e2;border:1px solid #ef4444;
+                    border-radius:10px;padding:10px 16px;text-align:center;">
+            <div style="font-size:10px;color:#dc2626;font-weight:600;">NEGATIVE</div>
+            <div style="font-size:22px;font-weight:700;color:#7f1d1d;">
+                {sent_counts.get('Negative', 0)}
+            </div>
+            <div style="font-size:10px;color:#64748b;">stories</div>
+        </div>
+        <div style="background:#f0f9ff;border:1px solid #93c5fd;
+                    border-radius:10px;padding:10px 16px;flex:1;min-width:160px;">
+            <div style="font-size:10px;color:#1d4ed8;font-weight:600;margin-bottom:4px;">
+                FORMAT
+            </div>
+            <div style="font-size:12px;color:#1e3a5f;font-weight:600;">
+                Hook + {len(subset)} stories + closing
+            </div>
+            <div style="font-size:10px;color:#64748b;">max 280 chars per tweet</div>
+        </div>
+    </div>"""
+
+
+# ---------------------------------------------------------------------------
+# Email newsletter generator
+# Produces a fully styled HTML email with a header, sentiment stats row,
+# and one card per article. Returns both a live preview and the raw HTML
+# source that can be pasted into Mailchimp or Gmail.
+# ---------------------------------------------------------------------------
+
+def generate_email_newsletter(articles: list) -> tuple:
+    if not articles:
+        msg = "No articles loaded. Fetch news from the AI Insights tab first."
+        return f'<p style="color:#475569;padding:20px;">{msg}</p>', ""
+
+    today        = datetime.now().strftime("%B %d, %Y")
+    total        = len(articles)
+    sent_counts  = Counter(a.get("sentiment", "Neutral") for a in articles)
+    keywords     = extract_keywords(articles, top_n=5)
+    skip         = {"artificial", "intelligence", "with", "that", "this", "from", "using"}
+    tag_list     = [f"#{kw.capitalize()}" for kw, _ in keywords if kw not in skip][:5]
+    tags_str     = "  ".join(tag_list)
+
+    SENT_COLOR = {"Positive": "#059669", "Neutral": "#2563eb", "Negative": "#dc2626"}
+    SENT_BG    = {"Positive": "#d1fae5", "Neutral": "#dbeafe", "Negative": "#fee2e2"}
+    SENT_LABEL = {"Positive": "Positive", "Neutral": "Neutral", "Negative": "Negative"}
+    TOPIC_BG   = {
+        "Technology": "#dbeafe", "Business": "#dcfce7",
+        "Health": "#fce7f3",     "Politics": "#fef3c7", "General": "#ede9fe",
+    }
+    TOPIC_FG   = {
+        "Technology": "#1d4ed8", "Business": "#15803d",
+        "Health": "#be185d",     "Politics": "#b45309", "General": "#6d28d9",
+    }
+
+    article_rows = ""
+    for i, art in enumerate(articles):
+        topic     = art.get("topic", "General")
+        sentiment = art.get("sentiment", "Neutral")
+        s_color   = SENT_COLOR.get(sentiment, "#2563eb")
+        s_bg      = SENT_BG.get(sentiment, "#dbeafe")
+        s_label   = SENT_LABEL.get(sentiment, "Neutral")
+        t_bg      = TOPIC_BG.get(topic, "#ede9fe")
+        t_fg      = TOPIC_FG.get(topic, "#6d28d9")
+        summary   = art.get("summary", art.get("title", ""))
+        source    = art.get("source", "Unknown")
+        link      = art.get("link", "#")
+        row_bg    = "#f8fafc" if i % 2 == 0 else "#ffffff"
+
+        article_rows += f"""
+        <tr>
+          <td style="padding:18px 24px;background:{row_bg};
+                     border-bottom:1px solid #e2e8f0;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td>
+                  <span style="background:{t_bg};color:{t_fg};font-size:11px;
+                               font-weight:700;padding:3px 10px;
+                               border-radius:99px;display:inline-block;
+                               margin-bottom:8px;">{topic}</span>
+                  &nbsp;
+                  <span style="background:{s_bg};color:{s_color};font-size:11px;
+                               font-weight:700;padding:3px 10px;
+                               border-radius:99px;display:inline-block;
+                               margin-bottom:8px;">{s_label}</span>
+                </td>
+              </tr>
+              <tr>
+                <td style="font-size:15px;font-weight:700;color:#0f172a;
+                           line-height:1.5;padding-bottom:8px;">{summary}</td>
+              </tr>
+              <tr>
+                <td style="font-size:12px;color:#64748b;padding-bottom:6px;">
+                  {source}
+                </td>
+              </tr>
+              <tr>
+                <td>
+                  <a href="{link}"
+                     style="font-size:12px;color:#2563eb;
+                            font-weight:600;text-decoration:none;">
+                    Read full article
+                  </a>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>"""
+
+    stats_row = f"""
+        <tr>
+          <td style="padding:20px 24px;background:#f0f9ff;">
+            <table width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td align="center" style="padding:0 8px;">
+                  <div style="font-size:11px;color:#64748b;font-weight:600;">
+                    TOTAL ARTICLES
+                  </div>
+                  <div style="font-size:24px;font-weight:700;color:#1e3a5f;">{total}</div>
+                </td>
+                <td align="center"
+                    style="padding:0 8px;border-left:1px solid #bfdbfe;">
+                  <div style="font-size:11px;color:#059669;font-weight:600;">
+                    POSITIVE
+                  </div>
+                  <div style="font-size:24px;font-weight:700;color:#059669;">
+                    {sent_counts.get("Positive", 0)}
+                  </div>
+                </td>
+                <td align="center"
+                    style="padding:0 8px;border-left:1px solid #bfdbfe;">
+                  <div style="font-size:11px;color:#2563eb;font-weight:600;">
+                    NEUTRAL
+                  </div>
+                  <div style="font-size:24px;font-weight:700;color:#2563eb;">
+                    {sent_counts.get("Neutral", 0)}
+                  </div>
+                </td>
+                <td align="center"
+                    style="padding:0 8px;border-left:1px solid #bfdbfe;">
+                  <div style="font-size:11px;color:#dc2626;font-weight:600;">
+                    NEGATIVE
+                  </div>
+                  <div style="font-size:24px;font-weight:700;color:#dc2626;">
+                    {sent_counts.get("Negative", 0)}
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>"""
+
+    html = f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#e8f4fc;
+             font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="background:#e8f4fc;padding:30px 0;">
+  <tr><td align="center">
+    <table width="620" cellpadding="0" cellspacing="0"
+           style="background:#ffffff;border-radius:12px;overflow:hidden;
+                  box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
+      <tr>
+        <td style="background:#1e3a5f;padding:32px 24px;text-align:center;">
+          <div style="font-size:11px;color:#60a5fa;font-weight:700;
+                      letter-spacing:2px;margin-bottom:8px;">
+            AI INSIGHTS VISTA
+          </div>
+          <div style="font-size:26px;font-weight:800;color:#ffffff;
+                      margin-bottom:6px;">
+            Your Daily AI Newsletter
+          </div>
+          <div style="font-size:13px;color:#93c5fd;">
+            {today} &nbsp;·&nbsp; {total} stories
+          </div>
+        </td>
+      </tr>
+
+      <tr>
+        <td style="background:#2563eb;padding:14px 24px;text-align:center;">
+          <div style="font-size:13px;color:#ffffff;font-weight:500;">
+            Top AI stories curated and sentiment-analysed automatically
+            &nbsp;·&nbsp; {tags_str}
+          </div>
+        </td>
+      </tr>
+
+      {stats_row}
+
+      <tr>
+        <td style="padding:20px 24px 8px;background:#ffffff;">
+          <div style="font-size:13px;font-weight:700;color:#64748b;
+                      letter-spacing:1px;text-transform:uppercase;">
+            Today's AI Headlines
+          </div>
+        </td>
+      </tr>
+
+      {article_rows}
+
+      <tr>
+        <td style="background:#1e3a5f;padding:24px;text-align:center;">
+          <div style="font-size:13px;color:#60a5fa;font-weight:600;
+                      margin-bottom:6px;">
+            AI Insights Vista
+          </div>
+          <div style="font-size:11px;color:#93c5fd;line-height:1.7;">
+            Generated automatically from live AI news feeds
+          </div>
+          <div style="margin-top:12px;font-size:11px;color:#475569;">
+            You received this because you subscribed to AI Insights Vista updates.
+          </div>
+        </td>
+      </tr>
+
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
+
+    return html, html
+
+
+# ---------------------------------------------------------------------------
+# Email delivery
+# Sends the newsletter to every subscriber via SMTP with TLS.
+# Works with Gmail App Passwords, Outlook, or any standard SMTP provider.
+# Subscribers are stored in a plain list in memory for this session.
+# ---------------------------------------------------------------------------
+
+_subscribers: list = []
+
+
+def add_subscriber(email: str) -> tuple:
+    email = email.strip().lower()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        return render_subscriber_list(), "Invalid email address."
+    if email in _subscribers:
+        return render_subscriber_list(), f"{email} is already subscribed."
+    _subscribers.append(email)
+    return render_subscriber_list(), f"{email} added. {len(_subscribers)} subscriber(s) total."
+
+
+def remove_subscriber(email: str) -> tuple:
+    email = email.strip().lower()
+    if email in _subscribers:
+        _subscribers.remove(email)
+        return render_subscriber_list(), f"{email} removed."
+    return render_subscriber_list(), f"{email} was not found in the subscriber list."
+
+
+def render_subscriber_list() -> str:
+    if not _subscribers:
+        return "<p style='color:#475569;padding:12px;font-size:13px;'>No subscribers yet.</p>"
+
+    rows = ""
+    for i, email in enumerate(_subscribers, 1):
+        bg = "#f0f9ff" if i % 2 == 0 else "#ffffff"
+        rows += f"""
+        <tr style="background:{bg};">
+          <td style="padding:8px 14px;color:#64748b;font-size:12px;">{i}</td>
+          <td style="padding:8px 14px;color:#1e3a5f;font-size:13px;">{email}</td>
+          <td style="padding:8px 14px;">
+            <span style="background:#dbeafe;color:#1d4ed8;font-size:10px;
+                         font-weight:600;padding:2px 8px;border-radius:99px;">
+              active
+            </span>
+          </td>
+        </tr>"""
+
+    return f"""
+    <table style="width:100%;border-collapse:collapse;
+                  font-family:'Segoe UI',sans-serif;
+                  background:#ffffff;border-radius:10px;overflow:hidden;">
+      <thead>
+        <tr style="background:#dbeafe;">
+          <th style="padding:10px 14px;color:#1e3a5f;font-size:11px;
+                     font-weight:600;text-align:left;">#</th>
+          <th style="padding:10px 14px;color:#1e3a5f;font-size:11px;
+                     font-weight:600;text-align:left;">EMAIL</th>
+          <th style="padding:10px 14px;color:#1e3a5f;font-size:11px;
+                     font-weight:600;text-align:left;">STATUS</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+    <p style="font-size:11px;color:#64748b;padding:8px 4px;">
+      {len(_subscribers)} subscriber(s)
+    </p>"""
+
+
+def send_newsletter(sender_email: str, app_password: str,
+                    smtp_server: str, subject: str, articles: list) -> str:
+    if not _subscribers:
+        return "No subscribers yet. Add at least one email address first."
+    if not sender_email.strip() or "@" not in sender_email:
+        return "Please enter a valid sender email address."
+    if not app_password.strip():
+        return "Please enter your App Password (Gmail) or SMTP password."
+    if not articles:
+        return "No articles loaded. Fetch news from the AI Insights tab first."
+
+    html_body, _ = generate_email_newsletter(articles)
+    sent_to  = []
+    failed   = []
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(smtp_server.strip(), 587) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.login(sender_email.strip(), app_password.strip())
+
+            for recipient in _subscribers:
+                try:
+                    msg            = MIMEMultipart("alternative")
+                    msg["Subject"] = subject.strip() or "Your Daily AI Insights Newsletter"
+                    msg["From"]    = sender_email.strip()
+                    msg["To"]      = recipient
+
+                    plain = f"AI Insights Vista Newsletter — {len(articles)} stories."
+                    msg.attach(MIMEText(plain, "plain"))
+                    msg.attach(MIMEText(html_body, "html"))
+
+                    server.sendmail(sender_email.strip(), recipient, msg.as_string())
+                    sent_to.append(recipient)
+                except Exception as e:
+                    failed.append(f"{recipient} ({e})")
+
+    except smtplib.SMTPAuthenticationError:
+        return (
+            "Authentication failed.\n\n"
+            "For Gmail:\n"
+            "  1. Enable 2-Factor Authentication at myaccount.google.com\n"
+            "  2. Go to Security > App Passwords > Generate\n"
+            "  3. Paste the 16-character password here\n\n"
+            "For Outlook: use smtp-mail.outlook.com as the server."
+        )
+    except Exception as e:
+        return f"SMTP connection error: {e}"
+
+    lines = [f"Newsletter sent to {len(sent_to)} subscriber(s).\n"]
+    if sent_to:
+        lines.append("Delivered to:")
+        lines.extend(f"  - {e}" for e in sent_to)
+    if failed:
+        lines.append("\nFailed:")
+        lines.extend(f"  - {e}" for e in failed)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Shared state
+# The fetched articles are stored here so all tabs can access the same data
+# without needing to re-fetch every time the user switches tabs.
+# ---------------------------------------------------------------------------
+
+_current_articles: list = []
+
+
+# ---------------------------------------------------------------------------
+# Gradio callback functions
+# Each function is called by a Gradio component and returns the output(s)
+# that the corresponding UI elements display.
+# ---------------------------------------------------------------------------
+
+def run_dashboard(selected_topics: list):
+    global _current_articles
+    if not selected_topics:
+        selected_topics = ["Technology"]
+    raw               = fetch_all_news(selected_topics)
+    _current_articles = aggregate_insights(raw)
+    return generate_news_html(_current_articles), generate_insight_summary(_current_articles)
+
+
+def run_poster():
+    return generate_poster(_current_articles)
+
+
+def run_charts():
+    return generate_charts(_current_articles)
+
+
+def run_linkedin():
+    return generate_linkedin_post(_current_articles)
+
+
+def run_twitter():
+    return generate_twitter_thread(_current_articles), generate_twitter_stats_html(_current_articles)
+
+
+def run_wikipedia(topic: str):
+    return fetch_wikipedia_summary(topic)
+
+
+def run_trending():
+    return generate_trending_chart(_current_articles), generate_trending_html(_current_articles)
+
+
+def run_word_cloud():
+    return generate_word_cloud(_current_articles), generate_word_cloud_stats_html(_current_articles)
+
+
+def run_newsletter():
+    return generate_email_newsletter(_current_articles)
+
+
+def run_add_subscriber(email: str):
+    return add_subscriber(email)
+
+
+def run_remove_subscriber(email: str):
+    return remove_subscriber(email)
+
+
+def run_send_newsletter(sender_email, app_password, smtp_server, subject):
+    return send_newsletter(sender_email, app_password, smtp_server, subject, _current_articles)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard UI
+# Light sky blue canvas background. Nine tabs in the specified order.
+# ---------------------------------------------------------------------------
+
+CSS = """
+body { background: #f5f3ff; color: #1e3a5f; font-family: 'Segoe UI', sans-serif; }
+.gradio-container { background: #f5f3ff !important; }
+.grid-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+    padding: 12px;
+}
+"""
+
+with gr.Blocks(title="AI Insights Vista") as app:
+
+    gr.Markdown(
+        "# AI Insights Vista\n"
+        "**From AI News to Intelligent Insights and Social Media Poster**"
+    )
+
+    with gr.Tabs():
+
+        # Tab 1 — Main news feed and sentiment summary
+        with gr.Tab("🤖 AI Insights"):
+            with gr.Row():
+                topic_selector = gr.CheckboxGroup(
+                    choices=list(TOPIC_SOURCES.keys()),
+                    value=["Technology"],
+                    label="Select Topic Categories",
+                )
+                run_btn = gr.Button("Fetch and Analyse", variant="primary", scale=0)
+
+            gr.Markdown("### Live AI News Feed")
+            news_html = gr.HTML()
+
+            gr.Markdown("### Aggregated Insights")
+            insights_box = gr.Textbox(
+                label="Insight Summary",
+                lines=12,
+                interactive=False,
+            )
+
+            run_btn.click(
+                fn=run_dashboard,
+                inputs=[topic_selector],
+                outputs=[news_html, insights_box],
+            )
+
+        # Tab 2 — Social media poster in the AI Technology Trends style
+        with gr.Tab("🎨 Poster"):
+            gr.Markdown(
+                "### Social Media Poster\n"
+                "Generates a light-themed poster with staggered article cards.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+            poster_btn = gr.Button("Generate Poster", variant="primary")
+            poster_img = gr.Image(label="AI Technology Trends Poster")
+            poster_btn.click(fn=run_poster, inputs=[], outputs=[poster_img])
+
+        # Tab 3 — LinkedIn post ready to copy and paste
+        with gr.Tab("💼 LinkedIn"):
+            gr.Markdown(
+                "### LinkedIn Post Generator\n"
+                "Formats the top headlines into a LinkedIn post with hashtags.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+            linkedin_btn = gr.Button("Generate LinkedIn Post", variant="primary")
+            linkedin_output = gr.Textbox(
+                label="LinkedIn Post (editable)",
+                lines=14,
+                interactive=True,
+                placeholder="Fetch news first, then click Generate.",
+            )
+            linkedin_btn.click(fn=run_linkedin, inputs=[], outputs=[linkedin_output])
+
+        # Tab 4 — Twitter/X thread with one tweet per article
+        with gr.Tab("🐦 Twitter"):
+            gr.Markdown(
+                "### Twitter / X Thread Generator\n"
+                "Breaks the news into a numbered thread.\n"
+                "Each tweet is under 280 characters and includes the sentiment and source.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+            twitter_btn = gr.Button("Generate Twitter Thread", variant="primary")
+            twitter_stats = gr.HTML()
+            twitter_output = gr.Textbox(
+                label="Twitter Thread (editable)",
+                lines=28,
+                interactive=True,
+                placeholder="Fetch news first, then click Generate.",
+            )
+            twitter_btn.click(
+                fn=run_twitter,
+                inputs=[],
+                outputs=[twitter_output, twitter_stats],
+            )
+
+        # Tab 5 — Wikipedia summary for any AI concept
+        with gr.Tab("📖 Wikipedia"):
+            gr.Markdown(
+                "### AI Topic Lookup\n"
+                "Type any AI concept to get its Wikipedia summary."
+            )
+            with gr.Row():
+                wiki_input = gr.Textbox(
+                    placeholder="e.g. Large Language Models, Generative AI, Transformers",
+                    label="AI Topic",
+                    scale=4,
+                )
+                wiki_btn = gr.Button("Search", variant="primary", scale=1)
+            wiki_output = gr.Textbox(
+                label="Wikipedia Summary",
+                lines=18,
+                interactive=False,
+            )
+            wiki_btn.click(fn=run_wikipedia, inputs=[wiki_input], outputs=[wiki_output])
+
+        # Tab 6 — Sentiment bar chart and keyword frequency chart
+        with gr.Tab("📈 Sentiment Chart"):
+            gr.Markdown(
+                "### Sentiment and Keyword Analytics\n"
+                "Two charts: sentiment distribution and top keyword frequency.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+            chart_btn  = gr.Button("Generate Charts", variant="primary")
+            chart_plot = gr.Plot(label="Sentiment and Keywords")
+            chart_btn.click(fn=run_charts, inputs=[], outputs=[chart_plot])
+
+        # Tab 7 — Top 15 keywords with colour-coded bar chart and frequency table
+        with gr.Tab("🔑 Keywords"):
+            gr.Markdown(
+                "### Trending Keywords\n"
+                "Top 15 keywords extracted from all fetched headlines.\n"
+                "Colour coded by frequency tier and tagged by topic category.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+            trend_btn   = gr.Button("Analyse Keywords", variant="primary")
+            trend_chart = gr.Plot(label="Keyword Frequency Bar Chart")
+            gr.Markdown("### Keyword Frequency Table")
+            trend_table = gr.HTML()
+            trend_btn.click(
+                fn=run_trending,
+                inputs=[],
+                outputs=[trend_chart, trend_table],
+            )
+
+        # Tab 8 — Word cloud sized by frequency and coloured by sentiment
+        with gr.Tab("☁️ Word Cloud"):
+            gr.Markdown(
+                "### Sentiment Word Cloud\n"
+                "Words are sized by how often they appear across all headlines.\n"
+                "Colour indicates sentiment: teal = positive, red = negative, blue = neutral.\n"
+                "Fetch news from the AI Insights tab first.\n\n"
+                "Install the wordcloud library for the visual cloud: pip install wordcloud"
+            )
+            wc_btn   = gr.Button("Generate Word Cloud", variant="primary")
+            wc_plot  = gr.Plot(label="Word Cloud")
+            wc_stats = gr.HTML()
+            wc_btn.click(fn=run_word_cloud, inputs=[], outputs=[wc_plot, wc_stats])
+
+        # Tab 9 — Newsletter preview, subscriber list, and SMTP mail delivery
+        with gr.Tab("📧 Mail Delivery"):
+            gr.Markdown(
+                "### Newsletter — Generate and Deliver\n"
+                "Step 1: generate a preview. Step 2: add subscribers. Step 3: send.\n"
+                "Fetch news from the AI Insights tab first."
+            )
+
+            gr.Markdown("#### Step 1 — Generate and Preview")
+            newsletter_btn     = gr.Button("Generate Newsletter Preview", variant="primary")
+            newsletter_preview = gr.HTML()
+            newsletter_source  = gr.Textbox(
+                label="HTML Source (copy into Mailchimp, Gmail, or Outlook)",
+                lines=10,
+                interactive=True,
+                placeholder="Click Generate to produce the HTML.",
+            )
+            newsletter_btn.click(
+                fn=run_newsletter,
+                inputs=[],
+                outputs=[newsletter_preview, newsletter_source],
+            )
+
+            gr.Markdown("#### Step 2 — Manage Subscribers")
+            with gr.Row():
+                sub_input  = gr.Textbox(
+                    placeholder="reader@example.com",
+                    label="Email address",
+                    scale=4,
+                )
+                add_btn    = gr.Button("Add",    variant="primary", scale=1)
+                remove_btn = gr.Button("Remove", scale=1)
+            sub_status = gr.Textbox(label="Status", lines=1, interactive=False)
+            sub_list   = gr.HTML(label="Subscriber List")
+
+            add_btn.click(
+                fn=run_add_subscriber,
+                inputs=[sub_input],
+                outputs=[sub_list, sub_status],
+            )
+            remove_btn.click(
+                fn=run_remove_subscriber,
+                inputs=[sub_input],
+                outputs=[sub_list, sub_status],
+            )
+
+            gr.Markdown(
+                "#### Step 3 — Send to All Subscribers\n"
+                "Gmail: Google Account > Security > App Passwords > Generate a 16-character password.\n"
+                "Outlook: use smtp-mail.outlook.com as the server and your normal password."
+            )
+            with gr.Row():
+                smtp_email    = gr.Textbox(
+                    placeholder="your@gmail.com",
+                    label="Sender Email",
+                    scale=3,
+                )
+                smtp_password = gr.Textbox(
+                    placeholder="16-character App Password",
+                    label="App Password",
+                    type="password",
+                    scale=3,
+                )
+                smtp_server   = gr.Textbox(
+                    value="smtp.gmail.com",
+                    label="SMTP Server",
+                    scale=2,
+                )
+            mail_subject = gr.Textbox(
+                value="Your Daily AI Insights Newsletter",
+                label="Email Subject",
+            )
+            send_btn    = gr.Button("Send Newsletter to All Subscribers", variant="primary")
+            send_status = gr.Textbox(label="Delivery Status", lines=8, interactive=False)
+            send_btn.click(
+                fn=run_send_newsletter,
+                inputs=[smtp_email, smtp_password, smtp_server, mail_subject],
+                outputs=[send_status],
+            )
+
+app.launch(css=CSS)
